@@ -1,516 +1,412 @@
-/**
- * LeetCode Monaco Injector: Background Service Worker
- *
- * Handles communication between the content script and the injected MAIN world scripts.
- * Responsibilities:
- * 1. Listens for 'injectAndCreateMonaco' messages from the content script.
- * 2. Orchestrates the injection of Monaco loader and editor core into the page's MAIN world.
- * 3. Configures Monaco environment (including worker paths).
- * 4. Creates the Monaco editor instance in the MAIN world.
- * 5. Injects logic into the MAIN world to synchronize code changes from the injected
- *    editor back to LeetCode's original (hidden) editor instance.
- * 6. Injects logic into the MAIN world to dispatch a custom event when code changes,
- *    triggering the save mechanism.
- * 7. Listens for 'saveCodeForTab' messages from the content script (triggered by the custom event).
- * 8. Saves the received code to chrome.storage.local, associated with the problem slug.
- * 9. Manages the association between tab IDs and problem slugs.
- * 10. Cleans up tab/slug associations when tabs are closed or navigate away.
- */
-'use strict';
-
-// --- Constants ---
-const LOG_PREFIX = '[Background]';
-const STORAGE_KEY_PREFIX = 'leetcodeCode-';
-const MONACO_LOADER_PATH = 'lib/monaco-editor/min/loader.js';
-const MONACO_BASE_URL_PATH = 'lib/monaco-editor/min/vs'; // Relative to extension root
-const MONACO_EDITOR_MAIN_PATH = 'vs/editor/editor.main';
-const MONACO_WORKER_PATH = 'lib/monaco-editor/min/vs/editor/editor.worker.js'; // Relative to extension root
-
-// MAIN world variable names (used within executeInMainWorld functions)
-const MW_REQUIRE_VAR = 'require';
-const MW_MONACO_VAR = 'monaco';
-const MW_INSTANCE_VAR = 'leetCodeMonacoInstance'; // Our injected editor instance
-const MW_LC_NAMESPACE_VAR = 'lcMonaco'; // LeetCode's original Monaco namespace (heuristic)
-const MW_INJECT_ERROR_FLAG = 'monacoInjectError';
-const MW_CREATE_STATUS_FLAG = 'monacoCreateStatus';
-const MW_SYNC_ERROR_FLAG = 'monacoSyncError';
-const MW_SYNC_SETUP_FLAG = 'monacoSyncSetup';
-const MW_SYNC_STATUS_FLAG = 'monacoSyncStatus';
-const MW_SAVE_EVENT_NAME = '__monaco_save_code__'; // Custom event dispatched from MAIN world
-
-// Polling Configuration
-const POLLING_INTERVAL_MS = 300;
-const MAX_POLLING_ATTEMPTS = 35; // Slightly increased to ~10.5 seconds total
+// background.js
+console.log('[Background] Service Worker started.');
 
 // --- State ---
-// Simple in-memory store for associating a problem slug with an active tab ID.
-// Lost when the service worker becomes inactive, but repopulated by content script on injection.
+// Stores the problem slug associated with each tab where the editor is injected.
+// Note: In-memory store, will be lost if the service worker becomes inactive for extended periods.
 const tabSlugs = {};
 
-// --- Logging Helper ---
-function log(level, tabId, ...args) {
-    const prefix = `${LOG_PREFIX}${tabId ? ` (Tab ${tabId})` : ''}:`;
-    switch (level) {
-        case 'error':
-            console.error(prefix, ...args);
-            break;
-        case 'warn':
-            console.warn(prefix, ...args);
-            break;
-        case 'info':
-        default:
-            console.log(prefix, ...args);
-            break;
-    }
-}
+// --- Constants ---
+const POLLING_INTERVAL_MS = 300;
+const MAX_POLLING_ATTEMPTS = 30; // ~9 seconds total polling time
+const SCRIPT_INJECTION_WORLD = 'MAIN'; // Inject scripts into the page's main execution context
 
-// --- Helper: Execute Script in MAIN world ---
-async function executeInMainWorld(tabId, func, args = []) {
-    try {
-        // Ensure tab still exists before attempting execution
-        await chrome.tabs.get(tabId);
-
-        const results = await chrome.scripting.executeScript({
-            target: { tabId: tabId, allFrames: false }, // Target only the top-level frame
-            world: 'MAIN',
-            func: func,
-            args: args,
-            injectImmediately: false // Generally safer for MAIN world
-        });
-
-        // executeScript returns an array of results, one for each frame matched.
-        // Since we target only the main frame, we expect one result.
-        if (results && results[0]) {
-             if (results[0].error) {
-                 // Handle errors reported by the execution itself
-                 log('error', tabId, `Script execution resulted in error:`, results[0].error);
-                 throw new Error(`MAIN world script execution error: ${results[0].error.message || results[0].error}`);
-             }
-             return results[0].result;
-        } else {
-            // This case should ideally not happen with a valid tabId and target
-            log('warn', tabId, 'executeInMainWorld received no results. Tab might be inaccessible or frame structure unexpected.');
-            return undefined;
-        }
-
-    } catch (error) {
-        // Catch errors from chrome.tabs.get (tab closed) or chrome.scripting.executeScript
-        if (error.message.includes('No tab with id') || error.message.includes('cannot be scripted')) {
-            log('warn', tabId, `Tab closed or became inaccessible during MAIN world script execution. Error:`, error.message);
-        } else {
-            log('error', tabId, `Error executing script in MAIN world:`, error);
-        }
-        // Rethrow to be handled by the calling context (e.g., stop polling)
-        throw error;
-    }
-}
-
-// --- Helper: Poll for a condition in MAIN world ---
-async function pollForCondition(tabId, checkFunc, description) {
-    let attempts = 0;
-    while (attempts < MAX_POLLING_ATTEMPTS) {
-        try {
-            // Tab existence check already happens within executeInMainWorld,
-            // but an extra check here doesn't hurt and catches closure before the call.
-            await chrome.tabs.get(tabId);
-        } catch (e) {
-            log('warn', tabId, `Tab closed or removed during polling for '${description}'. Aborting poll.`);
-            throw new Error(`Tab ${tabId} closed during polling.`);
-        }
-
-        log('info', tabId, `Polling attempt ${attempts + 1}/${MAX_POLLING_ATTEMPTS} for: ${description}`);
-        try {
-            // Execute the check function in the MAIN world
-            const result = await executeInMainWorld(tabId, checkFunc);
-            if (result) {
-                log('info', tabId, `Polling success for: ${description}`, result);
-                return result; // Condition met
-            }
-
-            // Check for explicit error flags set by MAIN world scripts
-            const errorStatus = await executeInMainWorld(tabId, () =>
-                window[MW_INJECT_ERROR_FLAG] || window[MW_SYNC_ERROR_FLAG] || (window[MW_CREATE_STATUS_FLAG] === 'error')
-            );
-            if (errorStatus) {
-                 // Retrieve the specific error message if available
-                 const specificError = await executeInMainWorld(tabId, () => window[MW_INJECT_ERROR_FLAG] || window[MW_SYNC_ERROR_FLAG] || 'Creation status indicated error');
-                 log('error', tabId, `Error signaled from page while polling for '${description}':`, specificError);
-                 throw new Error(`Page signaled error: ${specificError}`);
-            }
-
-        } catch (error) {
-            // Catch errors from executeInMainWorld OR the explicit error thrown above
-            log('error', tabId, `Error during polling for ${description}:`, error);
-            // If executeInMainWorld fails (e.g., navigation, tab closed), stop polling
-            throw error; // Propagate the error up
-        }
-
-        attempts++;
-        // Wait before the next attempt
-        await new Promise(resolve => setTimeout(resolve, POLLING_INTERVAL_MS));
-    }
-
-    // If loop completes without success
-    log('error', tabId, `Polling timed out after ${attempts} attempts for: ${description}`);
-    throw new Error(`Timeout waiting for ${description}`);
-}
-
-
-// --- Message Listener ---
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    // Ensure the message is from a content script within a tab
-    if (!sender.tab || !sender.tab.id) {
-        log('warn', null, 'Received message without sender tab context:', message);
-        return false; // Ignore messages not from tabs
-    }
-    const tabId = sender.tab.id;
-
-    // --- Handler for Monaco Injection Request ---
-    if (message.action === 'injectAndCreateMonaco') {
-        handleInjectRequest(tabId, message.options, sendResponse);
-        return true; // Indicate asynchronous response
-    }
-
-    // --- Handler for Save Code Request ---
-    else if (message.action === 'saveCodeForTab') {
-        handleSaveRequest(tabId, message.code, sendResponse);
-        return true; // Indicate asynchronous response
-    }
-
-    // --- Unknown action ---
-    else {
-        log('warn', tabId, `Received unknown action: ${message.action}`);
-        return false; // No asynchronous response needed
-    }
-});
-
-// --- Handler Functions ---
+// --- Helper Functions ---
 
 /**
- * Handles the 'injectAndCreateMonaco' request from the content script.
- * Orchestrates the entire injection and setup process.
+ * Executes a function within the MAIN execution world of a specific tab.
+ * @param {number} tabId - The ID of the target tab.
+ * @param {Function} func - The function to execute in the tab's context.
+ * @param {Array<any>} [args=[]] - Arguments to pass to the function.
+ * @returns {Promise<any>} A promise resolving with the result of the function execution.
+ * @throws Will throw an error if script execution fails.
  */
-async function handleInjectRequest(tabId, options, sendResponse) {
-    const { containerId, language, theme, initialCode, problemSlug } = options;
+async function executeInMainWorld(tabId, func, args = []) {
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId: tabId, allFrames: false }, // Target only the main frame
+      world: SCRIPT_INJECTION_WORLD,
+      func: func,
+      args: args,
+      // injectImmediately: false // Often recommended for MAIN world, but monitor stability
+    });
+    // Return the result from the first (and usually only) frame's execution
+    // Handle cases where results might be undefined or empty
+    return results?.[0]?.result;
+  } catch (error) {
+    console.error(`[Background] Error executing script in MAIN world (Tab ${tabId}):`, error);
+    // Check for common errors like tab closed or invalid context
+    if (error.message.includes("No tab with id") || error.message.includes("Cannot access")) {
+        throw new Error(`Tab ${tabId} closed or inaccessible during script execution.`);
+    }
+    throw error; // Re-throw other errors
+  }
+}
 
-    // Store the slug associated with this tab for later saving
-    if (problemSlug) {
-        tabSlugs[tabId] = problemSlug;
-        log('info', tabId, `Associated slug '${problemSlug}'`);
-    } else {
-        log('warn', tabId, `No problemSlug received with injection request. Code saving will not work for this tab.`);
-        delete tabSlugs[tabId]; // Clear any potentially stale slug
+/**
+ * Polls the MAIN execution world of a tab until a condition function returns true or timeout.
+ * @param {number} tabId - The ID of the target tab.
+ * @param {Function} checkFunc - A function (to be run in MAIN world) that returns true when the condition is met.
+ * @param {string} description - A description of the condition being polled for (for logging).
+ * @returns {Promise<any>} A promise resolving with the result of checkFunc when true, or rejecting on timeout/error.
+ */
+async function pollForCondition(tabId, checkFunc, description) {
+  let attempts = 0;
+  while (attempts < MAX_POLLING_ATTEMPTS) {
+    // Verify tab existence before each attempt
+    try {
+      await chrome.tabs.get(tabId);
+    } catch (e) {
+      console.log(`[Background] Tab ${tabId} closed or removed while polling for '${description}'. Aborting poll.`);
+      throw new Error(`Tab ${tabId} closed during polling for ${description}.`);
     }
 
-    log('info', tabId, `Received request to inject Monaco`, { containerId, language, theme, initialCodeLength: initialCode?.length ?? 0, slug: tabSlugs[tabId] });
+    // console.log(`[Background] (Tab ${tabId}) Polling attempt ${attempts + 1}/${MAX_POLLING_ATTEMPTS} for: ${description}`); // Verbose logging
+    try {
+      const result = await executeInMainWorld(tabId, checkFunc);
+      if (result) {
+        console.log(`[Background] (Tab ${tabId}) Polling SUCCESS for: ${description}`, result);
+        return result; // Condition met
+      }
+
+      // Check for explicit error flags set by the page script during polling
+      const errorStatus = await executeInMainWorld(tabId, () => window.monacoInjectError || window.monacoSyncError);
+      if (errorStatus) {
+          console.error(`[Background] (Tab ${tabId}) Page signaled error while polling for '${description}':`, errorStatus);
+          throw new Error(`Page signaled error: ${errorStatus}`); // Throw specific error
+      }
+
+    } catch (error) {
+        // Catch errors from executeInMainWorld OR the explicit error thrown above
+      console.error(`[Background] (Tab ${tabId}) Error during polling attempt for '${description}':`, error.message);
+      // If executeInMainWorld failed (e.g., navigation, tab closed), stop polling
+      throw error;
+    }
+
+    attempts++;
+    await new Promise(resolve => setTimeout(resolve, POLLING_INTERVAL_MS));
+  }
+
+  console.error(`[Background] (Tab ${tabId}) Polling TIMEOUT after ${attempts} attempts for: ${description}`);
+  throw new Error(`Timeout waiting for ${description} in tab ${tabId}`);
+}
+
+
+// --- Core Logic: Monaco Injection and Setup ---
+
+/**
+ * Handles the entire process of injecting Monaco Editor into a LeetCode page.
+ * @param {number} tabId - The ID of the target tab.
+ * @param {object} options - Options received from the content script.
+ * @param {string} options.containerId - The ID of the div to host the editor.
+ * @param {string} options.language - The language mode for the editor.
+ * @param {string} options.theme - The theme for the editor (e.g., 'vs-dark').
+ * @param {string} options.initialCode - The code to load initially.
+ * @param {string} options.problemSlug - The LeetCode problem slug.
+ * @param {function} sendResponse - Function to send response back to the content script.
+ */
+async function injectAndSetupMonaco(tabId, options, sendResponse) {
+    const { containerId, language, theme, initialCode, problemSlug } = options;
+
+    // Store slug association for saving later
+    if (problemSlug) {
+        tabSlugs[tabId] = problemSlug;
+        console.log(`[Background] (Tab ${tabId}) Associated slug '${problemSlug}'`);
+    } else {
+        console.warn(`[Background] (Tab ${tabId}) No problemSlug received. Code saving will not function correctly.`);
+        delete tabSlugs[tabId]; // Clear any previous slug if needed
+    }
+
+    console.log(`[Background] (Tab ${tabId}) Starting Monaco injection process for slug '${problemSlug}'`, { containerId, language, theme, initialCodeLength: initialCode?.length ?? 0 });
 
     try {
-        // --- Step 1: Inject Monaco Loader Script ---
-        log('info', tabId, `Injecting Monaco loader (${MONACO_LOADER_PATH})...`);
+        // --- Step 1: Inject Monaco Loader ---
+        console.log(`[Background] (Tab ${tabId}) Step 1: Injecting loader.js...`);
         await chrome.scripting.executeScript({
             target: { tabId: tabId, allFrames: false },
-            world: 'MAIN',
-            files: [MONACO_LOADER_PATH],
-            injectImmediately: false
+            world: SCRIPT_INJECTION_WORLD,
+            files: ['lib/monaco-editor/min/loader.js'],
+            // injectImmediately: false
         });
-        log('info', tabId, `Loader injected.`);
+        console.log(`[Background] (Tab ${tabId}) Step 1: loader.js injected.`);
 
-        // --- Step 2: Verify Loader Readiness (window.require) ---
-        log('info', tabId, `Verifying window.${MW_REQUIRE_VAR}...`);
-        await pollForCondition(
-            tabId,
-            () => typeof window[MW_REQUIRE_VAR] === 'function', // Check if require exists
-            `window.${MW_REQUIRE_VAR} definition`
-        );
-        log('info', tabId, `window.${MW_REQUIRE_VAR} verified.`);
+        // --- Step 2: Verify 'require' is Defined ---
+        console.log(`[Background] (Tab ${tabId}) Step 2: Polling for window.require definition...`);
+        await pollForCondition(tabId, () => typeof window.require === 'function', 'window.require definition');
+        console.log(`[Background] (Tab ${tabId}) Step 2: window.require verified.`);
 
-        // --- Step 3: Configure RequireJS & Monaco Environment, Load Editor Core ---
-        log('info', tabId, `Injecting Monaco config & load call...`);
-        const monacoBaseUrl = chrome.runtime.getURL(MONACO_BASE_URL_PATH);
-        const editorWorkerUrl = chrome.runtime.getURL(MONACO_WORKER_PATH); // Full URL for the worker script
+        // --- Step 3: Configure RequireJS & Load Monaco Core ---
+        console.log(`[Background] (Tab ${tabId}) Step 3: Injecting Monaco config & load call...`);
+        const monacoBaseUrl = chrome.runtime.getURL('lib/monaco-editor/min/vs');
+        const editorWorkerUrl = chrome.runtime.getURL('lib/monaco-editor/min/vs/editor/editor.worker.js'); // Ensure this path is correct
 
-        await executeInMainWorld(tabId, (baseUrl, workerUrl, workerPath, mainPath, constants) => {
+        await executeInMainWorld(tabId, (baseUrl, workerUrl) => {
             console.log('[PAGE] Configuring Monaco Environment and RequireJS...');
-            window[constants.MW_INJECT_ERROR_FLAG] = null; // Reset error flag
+            window.monacoInjectError = null; // Reset error flag
 
-            // Define MonacoEnvironment for worker loading
+            // Define MonacoEnvironment for worker loading (essential for MV3/CSP)
             window.MonacoEnvironment = {
-                getWorkerUrl: function (moduleId, label) {
-                    // Use the pre-calculated full worker URL.
-                    // This simplified approach assumes a single worker type.
-                    // Complex scenarios might check `label` (e.g., 'json', 'css', 'html').
-                    console.log(`[PAGE] Monaco requesting worker: label=${label}, module=${moduleId}. Providing URL: ${workerUrl}`);
+                getWorkerUrl: function (_moduleId, label) {
+                    // Simple worker loading strategy. May need label checks for specific workers (json, css, etc.) if used.
+                    const workerPath = 'lib/monaco-editor/min/vs/editor/editor.worker.js'; // Relative path within extension
+                    const fullWorkerUrl = chrome.runtime.getURL(workerPath); // Get full extension URL
+                    console.log(`[PAGE] Monaco requesting worker: label=${label}, path=${workerPath}, resolved URL=${fullWorkerUrl}`);
 
-                    // The Data URL hack remains a common way to handle cross-origin worker loading in extensions.
+                    // Use the data URL hack for cross-origin worker loading in MV3
                     return `data:text/javascript;charset=utf-8,${encodeURIComponent(`
+                        // Setup environment for the worker script itself
                         self.MonacoEnvironment = { baseUrl: '${chrome.runtime.getURL('lib/monaco-editor/min/')}' };
-                        importScripts('${workerUrl}');
+                        // Import the actual worker script
+                        importScripts('${fullWorkerUrl}');
                     `)}`;
                 }
             };
-            console.log('[PAGE] MonacoEnvironment configured.');
 
-            // Configure RequireJS paths
             console.log('[PAGE] Configuring require paths. Base URL:', baseUrl);
-            window[constants.MW_REQUIRE_VAR].config({
+            require.config({
                 paths: { 'vs': baseUrl },
-                'vs/nls': { availableLanguages: { '*': 'en' } } // Force English NLS bundles
+                'vs/nls': { availableLanguages: { '*': 'en'} } // Ensure NLS support is configured minimally
             });
 
-            // Initiate loading of the main editor module
-            console.log(`[PAGE] Calling require(["${mainPath}"])...`);
+            console.log('[PAGE] Calling require(["vs/editor/editor.main"]) asynchronously...');
+            // Use a promise to track loading state for polling
             window.monacoLoadingPromise = new Promise((resolve, reject) => {
-                window[constants.MW_REQUIRE_VAR]([mainPath], () => {
-                    console.log(`[PAGE] require callback: ${mainPath} loaded.`);
-                    if (typeof window[constants.MW_MONACO_VAR] !== 'undefined' && typeof window[constants.MW_MONACO_VAR].editor !== 'undefined') {
-                        console.log('[PAGE] Monaco global object (window.monaco) is available.');
-                        resolve();
-                    } else {
-                        const errorMsg = `require callback executed but window.${constants.MW_MONACO_VAR}.editor is not defined!`;
-                        console.error(`[PAGE] ERROR: ${errorMsg}`);
-                        window[constants.MW_INJECT_ERROR_FLAG] = errorMsg;
-                        reject(new Error(errorMsg));
+                require(
+                    ['vs/editor/editor.main'], // Module to load
+                    () => { // Success callback
+                        console.log('[PAGE] SUCCESS: require callback executed for vs/editor/editor.main.');
+                        if (typeof monaco !== 'undefined' && typeof monaco.editor !== 'undefined') {
+                            console.log('[PAGE] Monaco global object (window.monaco.editor) is available.');
+                            resolve(); // Signal success
+                        } else {
+                            console.error('[PAGE] ERROR: require callback executed but window.monaco or window.monaco.editor is not defined!');
+                            window.monacoInjectError = 'Monaco loaded via require, but global object not found.';
+                            reject(new Error(window.monacoInjectError));
+                        }
+                    },
+                    (error) => { // Error callback
+                        console.error('[PAGE] ERROR: Failed loading vs/editor/editor.main via require:', error);
+                        window.monacoInjectError = `RequireJS failed to load editor.main: ${error}`;
+                        reject(error);
                     }
-                }, (error) => {
-                    const errorMsg = `RequireJS failed to load ${mainPath}`;
-                    console.error(`[PAGE] ERROR: ${errorMsg}:`, error);
-                    window[constants.MW_INJECT_ERROR_FLAG] = `${errorMsg}: ${error}`;
-                    reject(error);
-                });
+                );
             });
-        }, [monacoBaseUrl, editorWorkerUrl, MONACO_WORKER_PATH, MONACO_EDITOR_MAIN_PATH, { // Pass constants
-            MW_REQUIRE_VAR, MW_MONACO_VAR, MW_INJECT_ERROR_FLAG
-        }]);
-        log('info', tabId, `Monaco config and load call injected.`);
+        }, [monacoBaseUrl, editorWorkerUrl]);
+        console.log(`[Background] (Tab ${tabId}) Step 3: Monaco config injected.`);
 
-        // --- Step 4: Poll for Monaco Core Readiness (window.monaco.editor) ---
-        log('info', tabId, `Polling for Monaco global object (window.${MW_MONACO_VAR}.editor)...`);
+        // --- Step 4: Poll for Monaco Global Object Readiness ---
+        console.log(`[Background] (Tab ${tabId}) Step 4: Polling for Monaco global object (window.monaco.editor)...`);
         await pollForCondition(
             tabId,
-            () => typeof window[MW_MONACO_VAR] !== 'undefined' && typeof window[MW_MONACO_VAR].editor !== 'undefined',
-            `window.${MW_MONACO_VAR}.editor definition after require`
+            () => typeof window.monaco !== 'undefined' && typeof window.monaco.editor !== 'undefined',
+            'window.monaco.editor definition after require'
         );
-        log('info', tabId, `Monaco global object confirmed.`);
+        console.log(`[Background] (Tab ${tabId}) Step 4: Monaco global object confirmed.`);
 
         // --- Step 5: Inject Editor Creation Code ---
-        log('info', tabId, `Injecting editor creation call...`);
-        await executeInMainWorld(tabId, (id, lang, editorTheme, code, constants) => {
-            console.log(`[PAGE] Creating Monaco editor in container #${id}`);
-            window[constants.MW_INJECT_ERROR_FLAG] = null; // Reset error flag
-            window[constants.MW_CREATE_STATUS_FLAG] = 'pending'; // Set status
+        console.log(`[Background] (Tab ${tabId}) Step 5: Injecting editor creation call...`);
+        await executeInMainWorld(tabId, (id, lang, editorTheme, code) => {
+            console.log(`[PAGE] Attempting to create Monaco editor in container #${id}`);
+            window.monacoInjectError = null; // Reset error flag
+            window.monacoCreateStatus = 'pending'; // Status flag for polling
 
             const container = document.getElementById(id);
             if (!container) {
-                const errorMsg = `Container element #${id} not found!`;
-                console.error(`[PAGE] ERROR: ${errorMsg}`);
-                window[constants.MW_INJECT_ERROR_FLAG] = errorMsg;
-                window[constants.MW_CREATE_STATUS_FLAG] = 'error';
-                return; // Stop creation
+                console.error(`[PAGE] FATAL ERROR: Container element #${id} not found in DOM!`);
+                window.monacoInjectError = `Container element #${id} not found`;
+                window.monacoCreateStatus = 'error';
+                return; // Stop execution in page context
             }
-
-            // Ensure container is visible and has basic dimensions/styling
+            // Ensure container is visible and has basic dimensions (can be overridden by CSS)
             container.style.display = 'block';
-            container.style.height = container.style.height || '600px'; // Default height if not set
+            container.style.height = container.style.height || '600px';
             container.style.width = container.style.width || '100%';
-            container.style.border = container.style.border || '1px solid #ccc'; // Visual aid
+            // container.style.border = container.style.border || '1px solid #ccc'; // Optional: visual cue
 
             try {
-                if (typeof window[constants.MW_MONACO_VAR] === 'undefined' || typeof window[constants.MW_MONACO_VAR].editor === 'undefined') {
-                    throw new Error(`window.${constants.MW_MONACO_VAR}.editor disappeared before creation!`);
+                // Double-check monaco exists right before creation
+                if (typeof monaco === 'undefined' || typeof monaco.editor === 'undefined') {
+                   throw new Error('window.monaco or monaco.editor disappeared unexpectedly before creation!');
                 }
 
+                console.log('[PAGE] Calling monaco.editor.create...');
                 // --- Create the Editor Instance ---
-                // Store it on window for access by sync listener
-                window[constants.MW_INSTANCE_VAR] = window[constants.MW_MONACO_VAR].editor.create(container, {
+                // Store on window for later access (e.g., sync, potentially user interaction)
+                window.leetCodeMonacoInstance = monaco.editor.create(container, {
                     value: code,
                     language: lang,
                     theme: editorTheme,
                     automaticLayout: true, // Essential for resizing
-                    minimap: { enabled: true },
-                    wordWrap: 'on', // Example: Enable word wrap
-                    scrollBeyondLastLine: false,
-                    // Add other Monaco editor options here as needed
+                    minimap: { enabled: true }, // Example option
+                    // Add other desired Monaco options here:
+                    // scrollBeyondLastLine: false,
+                    // wordWrap: 'on',
+                    // renderLineHighlight: 'gutter',
                 });
-
-                if (!window[constants.MW_INSTANCE_VAR]) {
-                     throw new Error(`monaco.editor.create call did not return an instance.`);
-                }
-
-                console.log(`[PAGE] Monaco editor instance (window.${constants.MW_INSTANCE_VAR}) created successfully.`);
-                window[constants.MW_CREATE_STATUS_FLAG] = 'success'; // Signal success
+                console.log('[PAGE] SUCCESS: Monaco editor instance (window.leetCodeMonacoInstance) created.');
+                window.monacoCreateStatus = 'success'; // Signal success for polling
 
             } catch (error) {
-                const errorMsg = `Editor creation failed: ${error.message}`;
                 console.error('[PAGE] ERROR creating Monaco editor instance:', error);
-                window[constants.MW_INJECT_ERROR_FLAG] = errorMsg;
-                window[constants.MW_CREATE_STATUS_FLAG] = 'error'; // Signal error
+                window.monacoInjectError = `Editor creation failed: ${error.message}`;
+                window.monacoCreateStatus = 'error'; // Signal error for polling
             }
-        }, [containerId, language, theme, initialCode, { // Pass constants
-            MW_MONACO_VAR, MW_INSTANCE_VAR, MW_INJECT_ERROR_FLAG, MW_CREATE_STATUS_FLAG
-        }]);
-        log('info', tabId, `Editor creation call injected.`);
+        }, [containerId, language, theme, initialCode]);
+        console.log(`[Background] (Tab ${tabId}) Step 5: Editor creation code injected.`);
 
         // --- Step 6: Poll for Editor Creation Status ---
-        log('info', tabId, `Polling for editor creation status...`);
+        console.log(`[Background] (Tab ${tabId}) Step 6: Polling for editor creation status...`);
         await pollForCondition(
             tabId,
-            () => window[MW_CREATE_STATUS_FLAG] === 'success' || window[MW_CREATE_STATUS_FLAG] === 'error',
-            `editor creation status (window.${MW_CREATE_STATUS_FLAG})`
+            // Wait for either explicit success or error status set by the creation script
+            () => window.monacoCreateStatus === 'success' || window.monacoCreateStatus === 'error',
+            'editor creation status (window.monacoCreateStatus)'
         );
 
         // Explicitly check the final status after polling
-        const creationStatusResult = await executeInMainWorld(tabId, () => window[MW_CREATE_STATUS_FLAG]);
-        if (creationStatusResult !== 'success') {
-            const creationError = await executeInMainWorld(tabId, () => window[MW_INJECT_ERROR_FLAG]);
-            throw new Error(`Editor creation failed or did not report success. Status: ${creationStatusResult}, Error: ${creationError || 'Unknown page error'}`);
+        const creationStatus = await executeInMainWorld(tabId, () => window.monacoCreateStatus);
+        if (creationStatus !== 'success') {
+            const creationError = await executeInMainWorld(tabId, () => window.monacoInjectError);
+            throw new Error(`Editor creation failed or did not report success. Final Status: ${creationStatus}, Error: ${creationError || 'Unknown page error'}`);
         }
-        log('info', tabId, `Monaco editor instance confirmed created on page.`);
+        console.log(`[Background] (Tab ${tabId}) Step 6: Monaco editor instance confirmed created on page.`);
 
-        // --- Step 7: Inject Code Sync Listener and Save Event Dispatcher ---
-        log('info', tabId, `Injecting code sync listener and save mechanism...`);
-        await executeInMainWorld(tabId, (constants) => {
-            console.log('[PAGE] Setting up code sync listener & save request logic...');
-            window[constants.MW_SYNC_ERROR_FLAG] = null; // Reset sync error flag
-            window[constants.MW_SYNC_SETUP_FLAG] = 'pending';
+        // --- Step 7: Inject Code Sync Listener (Editor -> LeetCode & Save Trigger) ---
+        // Renamed step for clarity, combines sync and save trigger logic injection
+        console.log(`[Background] (Tab ${tabId}) Step 7: Injecting code sync listener & save trigger...`);
+        await executeInMainWorld(tabId, (saveEventName) => {
+            // This function runs entirely in the LeetCode page's MAIN world context
+            console.log('[PAGE] Setting up code sync listener & save event trigger...');
+            window.monacoSyncError = null; // Reset sync-specific error flag
+            window.monacoSyncSetup = 'pending'; // Flag setup process
 
-            const editorInstance = window[constants.MW_INSTANCE_VAR];
-            if (!editorInstance) {
-                const errorMsg = `Injected instance (window.${constants.MW_INSTANCE_VAR}) is not defined! Cannot attach listener.`;
-                console.error(`[PAGE] Sync Setup ERROR: ${errorMsg}`);
-                window[constants.MW_SYNC_ERROR_FLAG] = errorMsg;
-                window[constants.MW_SYNC_SETUP_FLAG] = 'failed';
-                return; // Stop setup
+            // Ensure our editor instance exists
+            if (!window.leetCodeMonacoInstance) {
+                console.error('[PAGE] Sync Setup FATAL: window.leetCodeMonacoInstance is not defined! Cannot attach listener.');
+                window.monacoSyncError = 'Injected instance (leetCodeMonacoInstance) not found during sync setup.';
+                window.monacoSyncSetup = 'failed';
+                return;
+            }
+
+            // Check for LeetCode's editor namespace (may not exist immediately)
+            // Warning: This relies on LeetCode's internal 'lcMonaco' object. Highly fragile!
+            if (typeof window.lcMonaco?.editor?.getEditors !== 'function') {
+                console.warn('[PAGE] Sync Setup WARNING: window.lcMonaco.editor.getEditors not found initially. Sync might fail if it doesn\'t appear later.');
+                // Don't mark as failed yet, it might become available later
+                // window.monacoSyncError = 'Original LeetCode editor accessor (lcMonaco.editor.getEditors) not found initially.';
             }
 
             let debounceTimeout;
-            const DEBOUNCE_DELAY = 350; // ms delay for debouncing changes
+            const DEBOUNCE_DELAY_MS = 350; // Adjust as needed
 
-            console.log(`[PAGE] Attaching onDidChangeModelContent listener to window.${constants.MW_INSTANCE_VAR}.`);
-            editorInstance.onDidChangeModelContent(() => {
+            console.log('[PAGE] Attaching onDidChangeModelContent listener to window.leetCodeMonacoInstance.');
+            window.leetCodeMonacoInstance.onDidChangeModelContent(() => {
                 clearTimeout(debounceTimeout);
                 debounceTimeout = setTimeout(() => {
-                    console.log('[PAGE] Debounced change detected. Attempting sync & save request dispatch...');
-                    window[constants.MW_SYNC_STATUS_FLAG] = 'syncing';
+                    console.log('[PAGE] Debounced change detected. Attempting sync to LeetCode editor & dispatching save event...');
+                    window.monacoSyncStatus = 'syncing'; // Track current operation
 
-                    const currentCode = editorInstance.getValue();
-
-                    // --- Sync to original LeetCode editor (heuristic finding) ---
-                    // This is crucial for LC's Run/Submit buttons to get the latest code.
-                    // It relies on finding LC's internal Monaco instance via `lcMonaco`. This is FRAGILE.
-                    let syncSuccessful = false;
-                    let syncMethodUsed = 'none';
                     try {
-                        // Try to find the original editor instance(s)
-                        const lcMonacoNamespace = window[constants.MW_LC_NAMESPACE_VAR];
-                        if (!lcMonacoNamespace || typeof lcMonacoNamespace.editor?.getEditors !== 'function') {
-                             // Only log the error once to avoid flooding console
-                            if (window[constants.MW_SYNC_ERROR_FLAG] !== 'lcMonaco.editor.getEditors not found') {
-                                console.warn(`[PAGE] Sync Warning: window.${constants.MW_LC_NAMESPACE_VAR}.editor.getEditors is not available. Cannot sync code to original editor.`);
-                                window[constants.MW_SYNC_ERROR_FLAG] = 'lcMonaco.editor.getEditors not found'; // Set error for polling checks
+                        // --- Sync to LeetCode's hidden editor ---
+                        // WARNING: Fragile - Relies on LeetCode's internal structure/objects
+                        const lcEditorAccessor = window.lcMonaco?.editor;
+                        if (typeof lcEditorAccessor?.getEditors !== 'function') {
+                            if (!window.monacoSyncError) { // Log error only once per persistent issue
+                                console.error('[PAGE] Sync Error: window.lcMonaco.editor.getEditors is not available! Cannot sync.');
+                                window.monacoSyncError = 'lcMonaco.editor.getEditors not available for sync.';
                             }
-                             // NOTE: We might still proceed to dispatch the save event,
-                             // but Run/Submit might use stale code. Decide if this is acceptable.
-                             // For now, let's log the error but continue to dispatch save.
+                            window.monacoSyncStatus = 'error';
+                            return; // Cannot sync
+                        }
 
-                        } else {
-                            const leetCodeEditors = lcMonacoNamespace.editor.getEditors();
-                            if (!Array.isArray(leetCodeEditors) || leetCodeEditors.length === 0) {
-                                if (window[constants.MW_SYNC_ERROR_FLAG] !== 'No editors from getEditors()') {
-                                    console.warn('[PAGE] Sync Warning: getEditors() returned no editors.');
-                                    window[constants.MW_SYNC_ERROR_FLAG] = 'No editors from getEditors()';
-                                }
-                            } else {
-                                const targetEditorInstance = leetCodeEditors[0]; // Assume the first one is the main code editor
-                                if (!targetEditorInstance) {
-                                    if (window[constants.MW_SYNC_ERROR_FLAG] !== 'Target editor instance invalid') {
-                                        console.warn('[PAGE] Sync Warning: Target editor instance (editors[0]) is invalid.');
-                                        window[constants.MW_SYNC_ERROR_FLAG] = 'Target editor instance invalid';
-                                    }
-                                } else {
-                                    // Attempt to set value using common Monaco API methods
-                                    if (typeof targetEditorInstance.getModel === 'function') {
-                                        const targetModel = targetEditorInstance.getModel();
-                                        if (targetModel && typeof targetModel.setValue === 'function') {
-                                            console.log('[PAGE] Attempting sync via targetEditor.getModel().setValue()');
-                                            targetModel.setValue(currentCode);
-                                            syncMethodUsed = 'model.setValue';
-                                            syncSuccessful = true;
-                                        }
-                                    }
-                                    if (!syncSuccessful && typeof targetEditorInstance.setValue === 'function') {
-                                        console.log('[PAGE] Attempting sync via targetEditor.setValue()');
-                                        targetEditorInstance.setValue(currentCode);
-                                        syncMethodUsed = 'instance.setValue';
-                                        syncSuccessful = true;
-                                    }
+                        const leetCodeEditors = lcEditorAccessor.getEditors();
+                        const targetEditorInstance = leetCodeEditors?.[0]; // Assume first editor is the target
 
-                                    if (syncSuccessful) {
-                                        console.log(`[PAGE] Sync to original editor successful using method: ${syncMethodUsed}.`);
-                                        window[constants.MW_SYNC_ERROR_FLAG] = null; // Clear previous sync errors if successful now
-                                    } else {
-                                         if (window[constants.MW_SYNC_ERROR_FLAG] !== 'Target editor sync methods failed') {
-                                              console.error('[PAGE] Sync Error: Could not sync code to target editor using known methods.');
-                                              window[constants.MW_SYNC_ERROR_FLAG] = 'Target editor sync methods failed';
-                                         }
-                                    }
-                                }
+                        if (!targetEditorInstance) {
+                            if (!window.monacoSyncError) {
+                                console.error('[PAGE] Sync Error: lcMonaco.editor.getEditors() returned no valid editor instance.');
+                                window.monacoSyncError = 'Target LeetCode editor instance not found via getEditors().';
+                            }
+                            window.monacoSyncStatus = 'error';
+                            return; // Cannot sync
+                        }
+
+                        const currentCode = window.leetCodeMonacoInstance.getValue();
+                        console.log(`[PAGE] Syncing code (length: ${currentCode.length}) to target LeetCode editor instance.`);
+
+                        let syncSuccessful = false;
+                        // Try syncing using common methods (prefer model if available)
+                        if (typeof targetEditorInstance.getModel === 'function') {
+                            const targetModel = targetEditorInstance.getModel();
+                            if (targetModel && typeof targetModel.setValue === 'function') {
+                                targetModel.setValue(currentCode);
+                                syncSuccessful = true;
+                                // console.log('[PAGE] Sync method: model.setValue()');
                             }
                         }
-                    } catch (syncError) {
-                         console.error('[PAGE] Runtime Error during sync attempt:', syncError);
-                         window[constants.MW_SYNC_ERROR_FLAG] = `Runtime error during sync: ${syncError.message}`;
-                         syncSuccessful = false;
+                        // Fallback: Try setting value directly on the editor instance
+                        if (!syncSuccessful && typeof targetEditorInstance.setValue === 'function') {
+                            targetEditorInstance.setValue(currentCode);
+                            syncSuccessful = true;
+                            // console.log('[PAGE] Sync method: instance.setValue()');
+                        }
+
+                        if (syncSuccessful) {
+                             console.log('[PAGE] Sync to LeetCode editor successful.');
+                             window.monacoSyncError = null; // Clear previous transient sync errors
+
+                            // --- Trigger Save Request via Custom Event ---
+                            console.log(`[PAGE] Dispatching custom event '${saveEventName}' for saving.`);
+                            const saveEvent = new CustomEvent(saveEventName, {
+                                detail: { code: currentCode } // Pass the code to the content script listener
+                            });
+                            window.dispatchEvent(saveEvent);
+                            window.monacoSyncStatus = 'synced_and_save_requested';
+
+                        } else {
+                            // If both methods failed
+                            if (!window.monacoSyncError) {
+                                console.error('[PAGE] Sync Error: Could not sync code to target LeetCode editor. No known setValue method worked.');
+                                window.monacoSyncError = 'Failed to sync: Target editor missing known value setting methods.';
+                            }
+                            window.monacoSyncStatus = 'error';
+                        }
+
+                    } catch (error) {
+                        console.error('[PAGE] Runtime Error during sync/save dispatch process:', error);
+                        window.monacoSyncError = `Runtime error during sync/save dispatch: ${error.message}`;
+                        window.monacoSyncStatus = 'error';
                     }
-
-                    // --- Dispatch Custom Event for Saving ---
-                    // This happens regardless of whether sync to original editor worked,
-                    // ensuring the user's latest code is always saved by the extension.
-                    try {
-                        console.log(`[PAGE] Dispatching save request event ('${constants.MW_SAVE_EVENT_NAME}') with code (length: ${currentCode.length}).`);
-                        const saveEvent = new CustomEvent(constants.MW_SAVE_EVENT_NAME, {
-                            detail: { code: currentCode } // Pass the current code
-                        });
-                        window.dispatchEvent(saveEvent);
-                        // Update status based on whether sync also worked
-                        window[constants.MW_SYNC_STATUS_FLAG] = syncSuccessful ? 'synced_and_save_requested' : 'save_requested_sync_failed';
-                    } catch (dispatchError) {
-                         console.error('[PAGE] Runtime Error during save event dispatch:', dispatchError);
-                         window[constants.MW_SYNC_ERROR_FLAG] = `Runtime error dispatching save event: ${dispatchError.message}`;
-                         window[constants.MW_SYNC_STATUS_FLAG] = 'error';
-                    }
-
-
-                }, DEBOUNCE_DELAY); // End of setTimeout callback
+                }, DEBOUNCE_DELAY_MS); // End of setTimeout callback
             }); // End of onDidChangeModelContent listener
 
-            console.log('[PAGE] Code sync listener (including save request) attached successfully.');
-            window[constants.MW_SYNC_SETUP_FLAG] = 'success'; // Mark setup as successful
+            console.log('[PAGE] Code sync listener and save trigger attached successfully.');
+            window.monacoSyncSetup = 'success'; // Mark setup step successful
 
-        }, [{ // Pass constants
-             MW_INSTANCE_VAR, MW_LC_NAMESPACE_VAR, MW_SYNC_ERROR_FLAG, MW_SYNC_SETUP_FLAG,
-             MW_SYNC_STATUS_FLAG, MW_SAVE_EVENT_NAME
-        }]);
-        log('info', tabId, `Code sync listener and save mechanism injected.`);
+        }, [options.saveEventName || '__monaco_save_code__']); // Pass event name (use default if not provided)
+        console.log(`[Background] (Tab ${tabId}) Step 7: Sync listener injected.`);
 
-        // --- Step 8: Send Final Success Response to Content Script ---
-        log('info', tabId, `Monaco injection and setup process completed successfully. Sending success response.`);
+        // --- Step 8: Final Success Response ---
+        console.log(`[Background] (Tab ${tabId}) Monaco injection and setup process completed successfully. Sending success response.`);
         sendResponse({ success: true });
 
-    } catch (error) { // Catch block for the entire handleInjectRequest async function
-        log('error', tabId, `Monaco injection/setup process FAILED:`, error);
-        delete tabSlugs[tabId]; // Clean up slug association on failure
+    } catch (error) { // Catch block for the entire async injection process
+        console.error(`[Background] (Tab ${tabId}) FATAL ERROR during Monaco injection/setup process:`, error);
+        // Clean up slug association on any failure
+        delete tabSlugs[tabId];
 
-        // Attempt to signal the error on the page for easier debugging
-        const errorMessage = error?.message || 'Unknown background script error during injection/sync';
+        // Attempt to signal the error on the page for easier debugging (best effort)
+        const errorMessage = error instanceof Error ? error.message : String(error);
         try {
-            await executeInMainWorld(tabId, (msg, constants) => {
-                window[constants.MW_INJECT_ERROR_FLAG] = `Background script error: ${msg}`;
-                window[constants.MW_CREATE_STATUS_FLAG] = 'error';
-                window[constants.MW_SYNC_SETUP_FLAG] = 'failed';
+            await executeInMainWorld(tabId, (msg) => {
+                window.monacoInjectError = `Background script failure: ${msg}`;
+                // Update status flags to prevent potential hangs in other logic
+                window.monacoCreateStatus = window.monacoCreateStatus === 'pending' ? 'error' : window.monacoCreateStatus;
+                window.monacoSyncSetup = window.monacoSyncSetup === 'pending' ? 'failed' : window.monacoSyncSetup;
                 console.error(`[PAGE] Setting error flags due to background failure: ${msg}`);
-            }, [errorMessage, { MW_INJECT_ERROR_FLAG, MW_CREATE_STATUS_FLAG, MW_SYNC_SETUP_FLAG }]);
+            }, [errorMessage]);
         } catch (cleanupError) {
-            log('error', tabId, `Failed to set error state on page during cleanup:`, cleanupError);
+            console.error(`[Background] (Tab ${tabId}) Failed to set error state on page during cleanup:`, cleanupError);
         }
 
         // Send failure response back to the content script
@@ -518,60 +414,84 @@ async function handleInjectRequest(tabId, options, sendResponse) {
     }
 }
 
-/**
- * Handles the 'saveCodeForTab' request from the content script.
- */
-function handleSaveRequest(tabId, codeToSave, sendResponse) {
-    const slug = tabSlugs[tabId];
-
-    if (slug && codeToSave !== undefined && codeToSave !== null) {
-        const key = STORAGE_KEY_PREFIX + slug;
-        log('info', tabId, `Received request to save code for slug '${slug}' (key: '${key}', length: ${codeToSave.length})`);
-
-        chrome.storage.local.set({ [key]: codeToSave }, () => {
-            if (chrome.runtime.lastError) {
-                log('error', tabId, `Error saving code to storage for key ${key}:`, chrome.runtime.lastError);
-                sendResponse({ success: false, error: chrome.runtime.lastError.message });
-            } else {
-                log('info', tabId, `Successfully saved code for key ${key}.`);
-                sendResponse({ success: true });
-            }
-        });
-        // We've handled the async nature by returning true earlier
-
-    } else {
-        const reason = !slug ? 'slug missing' : 'code missing';
-        log('warn', tabId, `Could not save code. Reason: ${reason}. Slug: '${slug}', Code provided: ${codeToSave !== undefined && codeToSave !== null}`);
-        sendResponse({ success: false, error: `Cannot save code: ${reason}.` });
-        // Return false as sendResponse was called synchronously here
-        return false;
+// --- Message Listener ---
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    // Ensure the message is from a tab's content script
+    if (!sender.tab || !sender.tab.id) {
+        console.warn("[Background] Received message without sender tab ID:", message);
+        // Optionally send an error response if expecting one
+        // sendResponse({ success: false, error: "Invalid sender" });
+        return false; // Do not keep channel open
     }
-}
+    const tabId = sender.tab.id;
 
+    // --- Handler: Monaco Injection Request ---
+    if (message.action === 'injectAndCreateMonaco' && message.options) {
+        // Use the async function to handle the process
+        injectAndSetupMonaco(tabId, message.options, sendResponse);
+        // Return true to indicate that sendResponse will be called asynchronously
+        return true;
+    }
+
+    // --- Handler: Save Code Request ---
+    else if (message.action === 'saveCodeForTab') {
+        const slug = tabSlugs[tabId];
+        const codeToSave = message.code;
+
+        if (slug && codeToSave !== undefined) {
+            const storageKey = `leetcodeCode-${slug}`;
+            console.log(`[Background] (Tab ${tabId}) Received 'saveCodeForTab'. Saving code for slug '${slug}' (key: '${storageKey}', length: ${codeToSave.length})`);
+
+            chrome.storage.local.set({ [storageKey]: codeToSave }, () => {
+                // This callback runs AFTER the storage operation completes
+                if (chrome.runtime.lastError) {
+                    console.error(`[Background] (Tab ${tabId}) Error saving code to chrome.storage.local for key ${storageKey}:`, chrome.runtime.lastError);
+                    sendResponse({ success: false, error: chrome.runtime.lastError.message });
+                } else {
+                     console.log(`[Background] (Tab ${tabId}) Successfully saved code for key ${storageKey}.`);
+                     sendResponse({ success: true });
+                }
+            });
+            // Return true because sendResponse is called asynchronously in the storage callback
+            return true;
+
+        } else {
+            console.warn(`[Background] (Tab ${tabId}) Could not save code. Slug ('${slug}') or code (defined: ${codeToSave !== undefined}) missing/invalid.`);
+            // Send an immediate failure response as prerequisites are not met
+            sendResponse({ success: false, error: `Cannot save: Slug ('${slug}') is missing or code is undefined.` });
+            return false; // sendResponse was called synchronously
+        }
+    }
+
+    // --- Add other message handlers here if needed ---
+    // else if (message.action === 'someOtherAction') { ... }
+
+    // If no handler matched or the handler didn't return true, indicate synchronous response (or none)
+    // console.log("[Background] Message not handled or handled synchronously:", message.action);
+    return false;
+});
 
 // --- Tab Lifecycle Management ---
 
 // Clean up slug association when a tab is closed
 chrome.tabs.onRemoved.addListener((tabId) => {
     if (tabSlugs[tabId]) {
-        log('info', tabId, `Tab closed. Cleaning up slug association: '${tabSlugs[tabId]}'`);
+        console.log(`[Background] Tab ${tabId} closed. Cleaning up associated slug: '${tabSlugs[tabId]}'`);
         delete tabSlugs[tabId];
     }
 });
 
-// Clean up slug association if a tab navigates away from its associated problem page
+// Clean up slug association if a tab navigates away from a LeetCode problem page
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-    // Check only when page load is complete and we have a URL and a known slug for the tab
+    // Check only when the tab has finished loading and if we have a slug associated
     if (tabSlugs[tabId] && changeInfo.status === 'complete' && tab.url) {
         const associatedSlug = tabSlugs[tabId];
-        // Basic check: If the URL no longer contains the `/problems/slug/` pattern
-        if (!tab.url.includes(`/problems/${associatedSlug}`)) {
-            log('info', tabId, `Tab navigated away from problem page '${associatedSlug}'. Cleaning up slug association. New URL: ${tab.url}`);
+        const problemUrlPattern = `/problems/${associatedSlug}`; // Simple check
+
+        // If the URL no longer seems to be the specific problem page for the stored slug
+        if (!tab.url.includes("leetcode.com/problems/") || !tab.url.includes(problemUrlPattern)) {
+            console.log(`[Background] Tab ${tabId} navigated away from problem page for slug '${associatedSlug}'. Cleaning up slug association. New URL: ${tab.url}`);
             delete tabSlugs[tabId];
         }
     }
 });
-
-// --- Service Worker Initialization ---
-log('info', null, 'Background service worker started and listeners attached.');
-// Optional: Any other initialization needed when the worker starts.
