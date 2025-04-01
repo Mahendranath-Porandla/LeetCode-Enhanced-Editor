@@ -1,5 +1,6 @@
 # Ignore the entire Monaco Editor library
 lib/monaco-editor/
+node_modules
 
 # Optional: Ignore other things like Node modules if you use npm/yarn
 # node_modules/
