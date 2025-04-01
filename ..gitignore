@@ -1,0 +1,9 @@
+# Ignore the entire Monaco Editor library
+lib/monaco-editor/
+
+# Optional: Ignore other things like Node modules if you use npm/yarn
+# node_modules/
+
+# Optional: Ignore OS-specific files
+.DS_Store
+Thumbs.db

@@ -1,0 +1,21 @@
+/* Ensure our container takes up space */
+#monaco-editor-container {
+  width: 100%; /* Take full width of its parent */
+  height: 600px; /* Default height - adjust as needed */
+  min-height: 300px; /* Minimum height */
+  border: 1px solid #ccc; /* Visible border */
+  display: block; /* Ensure it's a block element */
+  /* Add other styles if needed, e.g., margin */
+  margin-top: 10px;
+}
+
+/* You might need styles to ensure the parent container */
+/* has appropriate dimensions as well, depending on where */
+/* you inject the #monaco-editor-container */
+
+/* Example: If injected directly into data-key="solution" */
+/* div[data-key="solution"] { */
+  /* display: flex; */
+  /* flex-direction: column; */
+/* } */
+
