@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "LeetCode Monaco Editor Injector",
-  "version": "0.2.1",
-  "description": "Replaces the LeetCode editor with Monaco Editor (Locally Bundled).",
+  "name": "LeetCode Monaco Editor Injector (Bundled)",
+  "version": "0.4.0",
+  "description": "Replaces the LeetCode editor with Monaco Editor (Bundled via Webpack).",
   "icons": {
     "16": "icons/icon16.png",
     "48": "icons/icon48.png",
@@ -17,7 +17,7 @@
     "*://*.leetcode.com/*"
   ],
   "background": {
-    "service_worker": "background.js"
+    "service_worker": "dist/background.bundle.js"
   },
   "content_scripts": [
     {
@@ -30,9 +30,10 @@
   "web_accessible_resources": [
     {
       "resources": [
-        "lib/monaco-editor/min/*",
-        "lib/monaco-editor/min/vs/editor/editor.worker.js"
-        ],
+        "dist/workers/*", 
+        "dist/fonts/*"
+
+      ],
       "matches": ["*://*.leetcode.com/*"]
     }
   ]

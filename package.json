@@ -1,5 +1,19 @@
+
 {
+
+  "scripts": {
+    "build": "webpack --mode production", 
+    "dev": "webpack --mode development --watch" 
+  },
   "dependencies": {
-    "monaco-editor": "^0.52.2"
+    "monaco-editor": "^0.47.0"
+  },
+  "devDependencies": {
+    "copy-webpack-plugin": "^12.0.2", 
+    "css-loader": "^7.1.1",
+    "monaco-editor-webpack-plugin": "^7.1.0",
+    "style-loader": "^4.0.0",
+    "webpack": "^5.91.0",
+    "webpack-cli": "^5.1.4"
   }
 }

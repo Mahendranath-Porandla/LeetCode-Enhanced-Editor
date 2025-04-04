@@ -1,4 +1,3 @@
-// content_scripts/leetcode_injector.js
 console.log("[Content Script] LeetCode Monaco Injector: Loaded.");
 
 // --- Constants ---
@@ -18,13 +17,11 @@ window.addEventListener(SAVE_EVENT_NAME, (event) => {
             (response) => {
                 if (chrome.runtime.lastError) {
                     console.error("[Content Script] Error sending 'saveCodeForTab' message:", chrome.runtime.lastError.message);
-                } else if (response && response.success) {
-                    // console.log("[Content Script] Background confirmed code save."); // Optional: uncomment for verbose logging
                 } else if (response && !response.success) {
                     console.error("[Content Script] Background reported save FAILURE:", response.error);
-                } else {
-                    console.warn("[Content Script] No response or unexpected response from background save action.");
                 }
+                 // Optional: Log success response from background if needed
+                 // else if (response && response.success) { console.log("[Content Script] Background confirmed code save."); }
             }
         );
     } else {
@@ -66,20 +63,18 @@ function findEditorContainerAndPrepare() {
         console.log(`[Content Script] Creating new Monaco container ('#${EDITOR_CONTAINER_ID}').`);
         container = document.createElement('div');
         container.id = EDITOR_CONTAINER_ID;
-        // Apply necessary styles via CSS or directly if needed
-        // container.style.height = '600px'; // Example: set height if not done in CSS
         parentToAppendTo.appendChild(container);
         console.log(`[Content Script] Appended Monaco container to parent:`, parentToAppendTo);
     }
 
-    container.style.display = 'block'; // Ensure visibility (redundant with CSS is okay)
+    container.style.display = 'block'; // Ensure visibility
     return EDITOR_CONTAINER_ID;
 }
 
 /**
  * Attempts to detect the currently selected language from the LeetCode UI.
- * WARNING: Relies on specific LeetCode UI selectors, which are fragile and may break.
- * @returns {string} The Monaco language ID (e.g., 'python', 'java', 'cpp') or 'plaintext' as a fallback.
+ * WARNING: Relies on specific LeetCode UI selectors, which are fragile.
+ * @returns {string} The Monaco language ID or 'plaintext' as a fallback.
  */
 function getLeetCodeLanguage() {
     // --- !!! FRAGILE SELECTOR - ADJUST IF LEETCODE UI CHANGES !!! ---
@@ -102,14 +97,12 @@ function getLeetCodeLanguage() {
                 "php": "php",
                 "swift": "swift",
                 "kotlin": "kotlin",
-                "dart": "dart",
+                "dart": "dart", // Monaco might not support Dart out-of-the-box
                 "golang": "go", "go": "go",
                 "ruby": "ruby",
                 "scala": "scala",
                 "rust": "rust",
-                "racket": "racket", // Check Monaco support
-                "erlang": "erlang", // Check Monaco support
-                "elixir": "elixir", // Check Monaco support
+                // Add other mappings as needed
             };
 
             const monacoLang = langMap[langText];
@@ -139,11 +132,10 @@ function findNestedKey(obj, keyToFind) {
     if (typeof obj !== 'object' || obj === null) {
         return null;
     }
-    if (keyToFind in obj) {
+    if (Object.prototype.hasOwnProperty.call(obj, keyToFind)) { // Use hasOwnProperty
         return obj[keyToFind];
     }
     for (const key in obj) {
-        // Avoid searching inherited properties
         if (Object.prototype.hasOwnProperty.call(obj, key)) {
             const result = findNestedKey(obj[key], keyToFind);
             if (result !== null) {
@@ -156,17 +148,18 @@ function findNestedKey(obj, keyToFind) {
 
 
 /**
- * Extracts the default code snippet for the currently selected language
- * by searching for 'codeSnippets' data in known locations (global vars, JSON scripts).
+ * Extracts the default code snippet for the currently selected language.
+ * Uses findNestedKey to search common data locations.
+ * @param {string} targetLanguageId - The Monaco language ID to search for (e.g., 'javascript', 'cpp').
  * @returns {string} The default code snippet, or a fallback message if not found.
  */
-function getDefaultCodeFromPageData() {
-    console.log("[Content Script] Attempting to retrieve default code from page data ('codeSnippets')...");
-    const fallbackCode = `// Monaco Editor Injected!\n// Failed to retrieve default code from page data.\n// Please check console logs.`;
+function getDefaultCodeFromPageData(targetLanguageId) {
+    console.log(`[Content Script] Attempting to retrieve default code from page data ('codeSnippets') for language: ${targetLanguageId}...`);
+    const fallbackCode = `// Monaco Editor Injected! (Language: ${targetLanguageId})\n// Failed to retrieve default code snippet for this language.\n// Please check console logs.`;
     let codeSnippets = null;
 
     // Strategy 1: Look in potential global variables
-    const potentialGlobalVars = ['__INITIAL_STATE__', 'pageData', 'payload']; // Add others if identified
+    const potentialGlobalVars = ['__INITIAL_STATE__', 'pageData', 'payload', 'appContext']; // Add common framework vars
     for (const varName of potentialGlobalVars) {
         if (typeof window[varName] === 'object' && window[varName] !== null) {
             let found = findNestedKey(window[varName], 'codeSnippets');
@@ -201,35 +194,29 @@ function getDefaultCodeFromPageData() {
         return fallbackCode;
     }
 
-    // Match the language
-    const currentMonacoLanguage = getLeetCodeLanguage(); // Get Monaco ID ('cpp', 'python', etc.)
-    console.log(`[Content Script] Looking for snippet with langSlug matching Monaco language: '${currentMonacoLanguage}'`);
+    // Match the target language
+    console.log(`[Content Script] Looking for snippet with langSlug matching Monaco language: '${targetLanguageId}'`);
 
     const languageDefinition = codeSnippets.find(snippet => {
         const slug = snippet?.langSlug?.toLowerCase();
         if (!slug) return false;
-        // Direct match or known variations
-        return slug === currentMonacoLanguage ||
-               (currentMonacoLanguage === 'python' && slug === 'python3') ||
-               (currentMonacoLanguage === 'go' && slug === 'golang');
+        // Direct match or known variations (add more aliases if LeetCode uses different slugs)
+        return slug === targetLanguageId ||
+               (targetLanguageId === 'python' && (slug === 'python3' || slug === 'python')) ||
+               (targetLanguageId === 'go' && slug === 'golang') ||
+               (targetLanguageId === 'cpp' && (slug === 'c++' || slug === 'cpp')) ||
+               (targetLanguageId === 'csharp' && slug === 'c#');
                // Add other specific mappings here if needed
     });
 
     // Extract code or use fallback
     if (languageDefinition && typeof languageDefinition.code === 'string') {
         console.log(`[Content Script] SUCCESS: Found default code snippet for langSlug '${languageDefinition.langSlug}'.`);
-        // JS usually handles unicode escapes implicitly when parsing JSON or assigning strings
+        // JSON parsing should handle unicode escapes, return the code directly.
         return languageDefinition.code;
     } else {
-        console.warn(`[Content Script] WARNING: Could not find a matching code snippet for Monaco language '${currentMonacoLanguage}'. Available langSlugs:`, codeSnippets.map(s => s?.langSlug));
-        // Fallback: Use the first snippet found?
-        const firstSnippet = codeSnippets[0];
-        if (firstSnippet && typeof firstSnippet.code === 'string') {
-            console.warn(`[Content Script] Using code for the first snippet ('${firstSnippet.langSlug}') as fallback.`);
-            return firstSnippet.code;
-        }
-        console.error(`[Content Script] ERROR: No matching language snippet found AND no fallback snippet available.`);
-        return fallbackCode + `\n// Detected language: ${currentMonacoLanguage}`;
+        console.warn(`[Content Script] WARNING: Could not find a matching code snippet for Monaco language '${targetLanguageId}'. Available langSlugs:`, codeSnippets.map(s => s?.langSlug));
+        return fallbackCode + `\n// Available snippet languages: ${codeSnippets.map(s => s?.langSlug).join(', ')}`;
     }
 }
 
@@ -249,17 +236,14 @@ function getProblemSlug() {
 
 /**
  * Main initialization function.
- * Finds/prepares the editor container, determines initial code (from storage or page data),
- * and sends a message to the background script to inject and create Monaco.
+ * Finds/prepares container, determines initial code, and messages background script.
  */
 function initializeEditor() {
     console.log("[Content Script] Initializing Monaco Editor injection...");
 
     const problemSlug = getProblemSlug();
     if (!problemSlug) {
-        // Decide if injection should proceed without a slug (saving won't work)
-        console.error("[Content Script] Cannot proceed with injection: Problem slug is required for saving functionality.");
-        // Optionally display an error to the user here
+        console.error("[Content Script] Cannot proceed: Problem slug is required for saving.");
         return;
     }
     console.log("[Content Script] Detected problem slug:", problemSlug);
@@ -270,32 +254,35 @@ function initializeEditor() {
         return;
     }
 
-    const storageKey = `leetcodeCode-${problemSlug}`;
+    // --- !!! LANGUAGE OVERRIDE FOR TESTING !!! ---
     const language = getLeetCodeLanguage(); // Detect language *before* fetching code
-    const theme = 'vs-dark'; // TODO: Make this configurable?
+    //const language = 'cpp'; // <-- FORCE JAVASCRIPT FOR TESTING BASIC SUGGESTIONS
+    console.warn(`[Content Script] FORCING LANGUAGE TO '${language}' FOR TESTING PURPOSES.`);
+    // ---------------------------------------------
 
-    // Check storage for previously saved code for this problem slug
-    console.log(`[Content Script] Checking chrome.storage.local for key: '${storageKey}'`);
+    const theme = 'vs-dark'; // Theme preference
+    const storageKey = `leetcodeCode-${problemSlug}-${language}`; // Make storage key language-specific too
+
+    console.log(`[Content Script] Checking chrome.storage.local for key: '${storageKey}' (using language: ${language})`);
     chrome.storage.local.get([storageKey], (result) => {
         let initialCode = "";
         let codeSource = "";
 
         if (chrome.runtime.lastError) {
             console.error("[Content Script] Error reading from chrome.storage:", chrome.runtime.lastError);
-            console.log("[Content Script] Falling back to default code from page data due to storage error.");
-            initialCode = getDefaultCodeFromPageData();
-            codeSource = "Default (Storage Error)";
+            initialCode = getDefaultCodeFromPageData(language); // Get default code for the TARGET language
+            codeSource = `Default (Storage Error, Lang: ${language})`;
         } else if (result && result[storageKey] !== undefined) {
-            console.log(`[Content Script] Found saved code for slug '${problemSlug}' in storage.`);
+            console.log(`[Content Script] Found saved code for slug '${problemSlug}' and lang '${language}' in storage.`);
             initialCode = result[storageKey];
             codeSource = "Storage";
         } else {
-            console.log(`[Content Script] No saved code found for slug '${problemSlug}'. Using default code from page data.`);
-            initialCode = getDefaultCodeFromPageData();
-            codeSource = "Default (No Saved)";
+            console.log(`[Content Script] No saved code found for slug '${problemSlug}' and lang '${language}'. Using default snippet.`);
+            initialCode = getDefaultCodeFromPageData(language); // Get default code for the TARGET language
+            codeSource = `Default (No Saved, Lang: ${language})`;
         }
 
-        console.log(`[Content Script] Requesting Monaco injection for slug '${problemSlug}'. Code source: ${codeSource}. Options:`, { containerId, language, theme, initialCodeLength: initialCode?.length ?? 0 });
+        console.log(`[Content Script] Requesting Monaco injection for slug '${problemSlug}'. Language: '${language}'. Code source: ${codeSource}. Options:`, { containerId, language, theme, initialCodeLength: initialCode?.length ?? 0 });
 
         // Send message to background script to perform the actual injection
         chrome.runtime.sendMessage(
@@ -303,7 +290,7 @@ function initializeEditor() {
                 action: 'injectAndCreateMonaco',
                 options: {
                     containerId: containerId,
-                    language: language,
+                    language: language, // Send the potentially overridden language
                     theme: theme,
                     initialCode: initialCode, // Use stored or default code
                     problemSlug: problemSlug  // Pass slug for background to associate with tab
@@ -312,6 +299,10 @@ function initializeEditor() {
             (response) => {
                 if (chrome.runtime.lastError) {
                     console.error('[Content Script] Error sending message to background:', chrome.runtime.lastError.message);
+                     // Display error in the placeholder container as a fallback
+                    const container = document.getElementById(containerId);
+                     if (container) container.innerHTML = `<p style='color:orange; padding: 10px; border: 1px dashed orange;'>Error communicating with background script: ${chrome.runtime.lastError.message}. Check extension logs.</p>`;
+
                 } else if (response) {
                     if (response.success) {
                         console.log('[Content Script] Background script reported SUCCESSFUL Monaco injection!');
@@ -320,11 +311,13 @@ function initializeEditor() {
                         // Display error in the placeholder container
                         const container = document.getElementById(containerId);
                         if (container) {
-                            container.innerHTML = `<p style='color:red; padding: 10px; border: 1px dashed red;'>Failed to load Monaco Editor: ${response.error || 'Unknown error'}. Check extension console (Background & Content Script).</p>`;
+                            container.innerHTML = `<p style='color:red; padding: 10px; border: 1px dashed red;'>Failed to load Monaco Editor: ${response.error || 'Unknown error'}. Check extension console (Background & Page).</p>`;
                         }
                     }
                 } else {
                      console.error('[Content Script] No response received from background script. It might have crashed or disconnected.');
+                     const container = document.getElementById(containerId);
+                     if (container) container.innerHTML = `<p style='color:red; padding: 10px; border: 1px dashed red;'>No response from background script. Check extension status and logs.</p>`;
                 }
             }
         );
@@ -333,23 +326,36 @@ function initializeEditor() {
 
 // --- Initialization Trigger ---
 // Wait for the LeetCode page structure (specifically the original editor) to likely exist.
-const MAX_INIT_ATTEMPTS = 15; // ~15 seconds
-const INIT_CHECK_INTERVAL_MS = 1000;
+const MAX_INIT_ATTEMPTS = 20; // Increase attempts slightly just in case
+const INIT_CHECK_INTERVAL_MS = 750; // Slightly faster check
 let initAttempts = 0;
+let initCheckInterval = null; // Hold interval ID
 
-const initCheckInterval = setInterval(() => {
+function attemptInitialization() {
     initAttempts++;
     const editorElement = document.querySelector(ORIGINAL_EDITOR_SELECTOR);
+    // Also check if our container *already* exists from a previous failed/partial load attempt
+    const existingContainer = document.getElementById(EDITOR_CONTAINER_ID);
 
-    if (editorElement) {
-        console.log(`[Content Script] Found '${ORIGINAL_EDITOR_SELECTOR}'. Proceeding with initialization.`);
-        clearInterval(initCheckInterval);
-        initializeEditor();
+    if (editorElement || existingContainer) {
+        // We need the original editor to know where to inject, even if reusing container
+        if (!editorElement) {
+            console.warn(`[Content Script] Found existing container '${EDITOR_CONTAINER_ID}', but original editor '${ORIGINAL_EDITOR_SELECTOR}' is missing. Attempting init anyway.`);
+        } else {
+             console.log(`[Content Script] Found '${ORIGINAL_EDITOR_SELECTOR}' (attempt ${initAttempts}). Proceeding with initialization.`);
+        }
+        if (initCheckInterval) clearInterval(initCheckInterval);
+        initializeEditor(); // Call the main function
     } else if (initAttempts >= MAX_INIT_ATTEMPTS) {
-        clearInterval(initCheckInterval);
-        console.error(`[Content Script] Timed out after ${initAttempts} attempts waiting for '${ORIGINAL_EDITOR_SELECTOR}' element to appear. Monaco injection aborted.`);
+        if (initCheckInterval) clearInterval(initCheckInterval);
+        console.error(`[Content Script] Timed out after ${initAttempts} attempts waiting for '${ORIGINAL_EDITOR_SELECTOR}' element. Monaco injection aborted.`);
     } else {
-        // Optional: Log waiting attempts
+        // Still waiting...
         // console.log(`[Content Script] Waiting for '${ORIGINAL_EDITOR_SELECTOR}'... Attempt ${initAttempts}/${MAX_INIT_ATTEMPTS}`);
     }
-}, INIT_CHECK_INTERVAL_MS);
+}
+
+// Start the interval check
+initCheckInterval = setInterval(attemptInitialization, INIT_CHECK_INTERVAL_MS);
+// Also run once quickly in case element is already there
+// setTimeout(attemptInitialization, 100); // Or just rely on the interval
